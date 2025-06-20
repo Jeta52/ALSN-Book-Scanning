@@ -12,22 +12,22 @@ class ALNSSolver:
         self.data = data
         self.destroy_percentage = destroy_percentage
         self.min_destroy_percentage = 0.1
-        self.max_destroy_percentage = 0.5
+        self.max_destroy_percentage = 0.4
         self.iterations_since_improvement = 0
         
         # Reaction factor for weight adjustments (how quickly weights adapt)
         self.reaction_factor = 0.1
         
         # Segment size for weight adjustments
-        self.segment_size = 100
+        self.segment_size = 50  # Reduced for more frequent updates
         
         # Score weights for different improvement types
         self.score_weights = {
-            'global_best': 15,    # New best solution found
-            'significant': 8,     # Improvement > 1% over current
-            'improvement': 5,     # Any improvement over current
-            'accepted': 2,        # Accepted but not better
-            'rejected': 0         # Not accepted
+            'global_best': 20,    # New best solution found
+            'significant': 10,    # Improvement > 1% over current
+            'improvement': 6,     # Any improvement over current
+            'accepted': 3,        # Accepted but not better
+            'rejected': 1         # Not accepted (still gets small reward)
         }
         
         # Weights for destroy operators
@@ -62,7 +62,9 @@ class ALNSSolver:
             'initial_score': 0,
             'final_score': 0,
             'best_destroy_op': None,
-            'best_repair_op': None
+            'best_repair_op': None,
+            'accepted_worse': 0,
+            'rejected': 0
         }
         
     def solve(self, time_limit=600) -> Solution:  # 10 minutes = 600 seconds
@@ -77,6 +79,8 @@ class ALNSSolver:
         print("Generating initial solution using GRASP...")
         current_solution = InitialSolution.generate_initial_solution_grasp(self.data)
         best_solution = current_solution.clone()
+        # Ensure best_solution has correct fitness score
+        best_solution.calculate_fitness_score(self.data.scores)
         
         self.stats['initial_score'] = current_solution.fitness_score
         print(f"Initial solution score: {current_solution.fitness_score}")
@@ -85,6 +89,9 @@ class ALNSSolver:
         best_destroy_op_count = {op: 0 for op in self.destroy_weights}
         best_repair_op_count = {op: 0 for op in self.repair_weights}
         
+        # Temperature for simulated annealing
+        initial_temp = current_solution.fitness_score * 0.1  # 10% of initial score
+        
         while (time.time() - start_time) < time_limit:
             # Select destroy and repair operators based on weights
             destroy_op = self._select_operator(self.destroy_weights)
@@ -92,6 +99,8 @@ class ALNSSolver:
             
             # Create a copy of current solution
             temp_solution = current_solution.clone()
+            # Ensure cloned solution has correct fitness score
+            temp_solution.calculate_fitness_score(self.data.scores)
             
             # Apply destroy operator
             removed_libraries = destroy_op(temp_solution)
@@ -99,8 +108,13 @@ class ALNSSolver:
             # Apply repair operator
             new_solution = repair_op(temp_solution, removed_libraries)
             
-            # Accept or reject the new solution
-            if new_solution.fitness_score >= current_solution.fitness_score:
+            # Calculate improvement
+            delta = new_solution.fitness_score - current_solution.fitness_score
+            
+            # Accept or reject the new solution - ONLY ACCEPT BETTER SOLUTIONS
+            accept = False
+            if delta > 0:  # Only accept strictly better solutions
+                accept = True
                 current_solution = new_solution
                 self.stats['improvements'] += 1
                 
@@ -111,53 +125,43 @@ class ALNSSolver:
                     self.repair_scores[repair_op] += self.score_weights['global_best']
                     
                     best_solution = new_solution.clone()
+                    # Ensure best_solution has correct fitness score
+                    best_solution.calculate_fitness_score(self.data.scores)
+                    
                     self.stats['time_to_best'] = time.time() - start_time
                     best_destroy_op_count[destroy_op] += 1
                     best_repair_op_count[repair_op] += 1
                     
+                    print(f"New best solution found: {best_solution.fitness_score} (improvement: {delta})")
+                    
                     # Reset iterations since improvement and reduce destroy percentage
                     self.iterations_since_improvement = 0
                     self.destroy_percentage = max(self.min_destroy_percentage, 
-                                                self.destroy_percentage * 0.9)
-                elif new_solution.fitness_score > current_solution.fitness_score:
-                    improvement_percentage = ((new_solution.fitness_score - current_solution.fitness_score) 
-                                           / current_solution.fitness_score)
+                                                self.destroy_percentage * 0.95)
+                else:
+                    # Regular improvement
+                    improvement_percentage = delta / current_solution.fitness_score
                     if improvement_percentage > 0.01:  # More than 1% improvement
                         self.destroy_scores[destroy_op] += self.score_weights['significant']
                         self.repair_scores[repair_op] += self.score_weights['significant']
                     else:
                         self.destroy_scores[destroy_op] += self.score_weights['improvement']
                         self.repair_scores[repair_op] += self.score_weights['improvement']
-                else:
-                    # Equal to current solution
-                    self.destroy_scores[destroy_op] += self.score_weights['accepted']
-                    self.repair_scores[repair_op] += self.score_weights['accepted']
-            # Implement simulated annealing acceptance criterion
             else:
-                # Calculate probability of accepting worse solution
-                temperature = max(0.01, 1.0 - (time.time() - start_time) / time_limit)  # Linear cooling
-                delta = new_solution.fitness_score - current_solution.fitness_score
-                probability = min(1.0, math.exp(delta / (temperature * current_solution.fitness_score * 0.01)))
-                
-                if random.random() < probability:
-                    current_solution = new_solution
-                    # Accepted worse solution
-                    self.destroy_scores[destroy_op] += self.score_weights['accepted']
-                    self.repair_scores[repair_op] += self.score_weights['accepted']
-                else:
-                    # Rejected solution
-                    self.destroy_scores[destroy_op] += self.score_weights['rejected']
-                    self.repair_scores[repair_op] += self.score_weights['rejected']
+                # Solution is worse or equal - reject it
+                self.stats['rejected'] += 1
+                self.destroy_scores[destroy_op] += self.score_weights['rejected']
+                self.repair_scores[repair_op] += self.score_weights['rejected']
             
             # Increase destroy percentage if stuck in local optima
             self.iterations_since_improvement += 1
-            if self.iterations_since_improvement > 50:
+            if self.iterations_since_improvement > 100:
                 self.destroy_percentage = min(self.max_destroy_percentage, 
-                                            self.destroy_percentage * 1.1)
+                                            self.destroy_percentage * 1.05)
                 self.iterations_since_improvement = 0
             
             # Update weights periodically
-            if self.stats['iterations'] % self.segment_size == 0:
+            if self.stats['iterations'] > 0 and self.stats['iterations'] % self.segment_size == 0:
                 self._update_weights()
             
             self.stats['iterations'] += 1
@@ -168,9 +172,13 @@ class ALNSSolver:
                 elapsed_time = current_time - start_time
                 print(f"\nProgress after {elapsed_time:.1f} seconds:")
                 print(f"Iterations: {self.stats['iterations']}")
-                print(f"Time since last improvement: {current_time - (start_time + self.stats['time_to_best']):.1f}s")
+                print(f"Current score: {current_solution.fitness_score}")
+                print(f"Best score: {best_solution.fitness_score}")
+                print(f"Improvements: {self.stats['improvements']}")
+                print(f"Rejected: {self.stats['rejected']}")
+                print(f"Destroy percentage: {self.destroy_percentage:.3f}")
                 
-                # Print top destroy operators
+                # Print top operators
                 top_destroy = sorted(self.destroy_weights.items(), key=lambda x: x[1], reverse=True)[:2]
                 top_repair = sorted(self.repair_weights.items(), key=lambda x: x[1], reverse=True)[:2]
                 print(f"Top destroy operators: {top_destroy[0][0].__name__} ({top_destroy[0][1]:.2f}), {top_destroy[1][0].__name__} ({top_destroy[1][1]:.2f})")
@@ -182,41 +190,31 @@ class ALNSSolver:
         self.stats['final_score'] = best_solution.fitness_score
         
         # Determine best operators
-        self.stats['best_destroy_op'] = max(best_destroy_op_count.items(), key=lambda x: x[1])[0].__name__
-        self.stats['best_repair_op'] = max(best_repair_op_count.items(), key=lambda x: x[1])[0].__name__
+        if best_destroy_op_count:
+            self.stats['best_destroy_op'] = max(best_destroy_op_count.items(), key=lambda x: x[1])[0].__name__
+        if best_repair_op_count:
+            self.stats['best_repair_op'] = max(best_repair_op_count.items(), key=lambda x: x[1])[0].__name__
         
         total_time = time.time() - start_time
         print("\nFinal Statistics:")
         print(f"Total time: {total_time:.1f} seconds")
         print(f"Total iterations: {self.stats['iterations']}")
         print(f"Initial score: {self.stats['initial_score']}")
+        print(f"Final score: {self.stats['final_score']}")
+        print(f"Improvement: {self.stats['final_score'] - self.stats['initial_score']}")
         print(f"Time to best solution: {self.stats['time_to_best']:.1f} seconds")
-        print(f"Most successful destroy operator: {self.stats['best_destroy_op']}")
-        print(f"Most successful repair operator: {self.stats['best_repair_op']}")
+        if self.stats['best_destroy_op']:
+            print(f"Most successful destroy operator: {self.stats['best_destroy_op']}")
+        if self.stats['best_repair_op']:
+            print(f"Most successful repair operator: {self.stats['best_repair_op']}")
         
         return best_solution
     
     def _select_operator(self, weights: Dict) -> callable:
-        """Select an operator based on weights and usage history"""
+        """Select an operator based on weights with roulette wheel selection"""
         operators = list(weights.keys())
-        weights_list = []
+        weights_list = [max(0.1, weights[op]) for op in operators]  # Ensure minimum weight
         
-        # Get usage counts
-        usage_dict = self.destroy_usage if operators[0] in self.destroy_weights else self.repair_usage
-        total_usage = sum(usage_dict.values()) + len(operators)  # Add len(operators) to avoid division by zero
-        
-        for op in operators:
-            # Base weight from adaptive scoring
-            weight = weights[op]
-            
-            # Adjust weight based on usage frequency to promote diversity
-            usage = usage_dict[op]
-            usage_penalty = (usage / total_usage) ** 2  # Quadratic penalty for frequently used operators
-            
-            # Final weight combines base weight with usage penalty
-            final_weight = weight * (1.0 - usage_penalty)
-            weights_list.append(max(0.1, final_weight))  # Ensure minimum weight of 0.1
-            
         # Update usage counter for selected operator
         selected = random.choices(operators, weights=weights_list, k=1)[0]
         if selected in self.destroy_weights:
@@ -228,34 +226,30 @@ class ALNSSolver:
     
     def _update_weights(self):
         """Update weights of operators based on their success using reaction factor"""
-        # Only update weights every segment_size iterations
-        if self.stats['iterations'] % self.segment_size != 0:
-            return
-            
         # Update destroy weights
-        total_destroy_score = sum(self.destroy_scores.values()) + 1e-10
         for op in self.destroy_weights:
             if self.destroy_usage[op] > 0:  # Only update if operator was used
-                normalized_score = self.destroy_scores[op] / self.destroy_usage[op]
-                normalized_score = normalized_score / total_destroy_score
+                avg_score = self.destroy_scores[op] / self.destroy_usage[op]
+                # Normalize score to [0, 1] range
+                normalized_score = avg_score / max(1, max(self.score_weights.values()))
                 
                 # Update weight using reaction factor
                 self.destroy_weights[op] = (
                     (1 - self.reaction_factor) * self.destroy_weights[op] +
-                    self.reaction_factor * normalized_score
+                    self.reaction_factor * max(0.1, normalized_score)
                 )
             
         # Update repair weights similarly
-        total_repair_score = sum(self.repair_scores.values()) + 1e-10
         for op in self.repair_weights:
             if self.repair_usage[op] > 0:  # Only update if operator was used
-                normalized_score = self.repair_scores[op] / self.repair_usage[op]
-                normalized_score = normalized_score / total_repair_score
+                avg_score = self.repair_scores[op] / self.repair_usage[op]
+                # Normalize score to [0, 1] range
+                normalized_score = avg_score / max(1, max(self.score_weights.values()))
                 
                 # Update weight using reaction factor
                 self.repair_weights[op] = (
                     (1 - self.reaction_factor) * self.repair_weights[op] +
-                    self.reaction_factor * normalized_score
+                    self.reaction_factor * max(0.1, normalized_score)
                 )
             
         # Reset scores and usage for next segment
@@ -267,9 +261,11 @@ class ALNSSolver:
     # Destroy Operators
     def random_library_removal(self, solution: Solution) -> List[int]:
         """Randomly remove libraries from the solution"""
-        num_to_remove = int(len(solution.signed_libraries) * self.destroy_percentage)
-        if num_to_remove == 0:
-            num_to_remove = 1
+        if not solution.signed_libraries:
+            return []
+            
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        num_to_remove = min(num_to_remove, len(solution.signed_libraries))
             
         indices_to_remove = random.sample(range(len(solution.signed_libraries)), num_to_remove)
         removed_libraries = []
@@ -289,18 +285,20 @@ class ALNSSolver:
     
     def low_efficiency_library_removal(self, solution: Solution) -> List[int]:
         """Remove libraries with lowest efficiency (score/signup days)"""
+        if not solution.signed_libraries:
+            return []
+            
         library_efficiencies = []
         for lib_id in solution.signed_libraries:
             library = self.data.libs[lib_id]
             books = solution.scanned_books_per_library.get(lib_id, [])
             score = sum(self.data.scores[book_id] for book_id in books)
-            efficiency = score / (library.signup_days + 1e-10)
+            efficiency = score / max(1, library.signup_days)  # Avoid division by zero
             library_efficiencies.append((lib_id, efficiency))
             
         library_efficiencies.sort(key=lambda x: x[1])
-        num_to_remove = int(len(solution.signed_libraries) * self.destroy_percentage)
-        if num_to_remove == 0:
-            num_to_remove = 1
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        num_to_remove = min(num_to_remove, len(library_efficiencies))
             
         removed_libraries = []
         for i in range(num_to_remove):
@@ -318,20 +316,23 @@ class ALNSSolver:
     
     def duplicate_book_removal(self, solution: Solution) -> List[int]:
         """Remove libraries with highest number of duplicate books"""
+        if not solution.signed_libraries:
+            return []
+            
         library_duplicates = []
         for lib_id in solution.signed_libraries:
             books = solution.scanned_books_per_library.get(lib_id, [])
             duplicates = 0
             for book_id in books:
-                if sum(1 for other_lib_id, other_books in solution.scanned_books_per_library.items()
-                      if other_lib_id != lib_id and book_id in other_books) > 0:
-                    duplicates += 1
+                # Count how many other libraries also have this book
+                for other_lib_id, other_books in solution.scanned_books_per_library.items():
+                    if other_lib_id != lib_id and book_id in other_books:
+                        duplicates += 1
             library_duplicates.append((lib_id, duplicates))
             
         library_duplicates.sort(key=lambda x: x[1], reverse=True)
-        num_to_remove = int(len(solution.signed_libraries) * self.destroy_percentage)
-        if num_to_remove == 0:
-            num_to_remove = 1
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        num_to_remove = min(num_to_remove, len(library_duplicates))
             
         removed_libraries = []
         for i in range(num_to_remove):
@@ -349,6 +350,9 @@ class ALNSSolver:
     
     def overlap_based_removal(self, solution: Solution) -> List[int]:
         """Remove libraries with highest overlap in book coverage"""
+        if not solution.signed_libraries:
+            return []
+            
         library_overlaps = []
         for lib_id in solution.signed_libraries:
             books = set(solution.scanned_books_per_library.get(lib_id, []))
@@ -360,9 +364,8 @@ class ALNSSolver:
             library_overlaps.append((lib_id, overlap))
             
         library_overlaps.sort(key=lambda x: x[1], reverse=True)
-        num_to_remove = int(len(solution.signed_libraries) * self.destroy_percentage)
-        if num_to_remove == 0:
-            num_to_remove = 1
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        num_to_remove = min(num_to_remove, len(library_overlaps))
             
         removed_libraries = []
         for i in range(num_to_remove):
@@ -381,8 +384,17 @@ class ALNSSolver:
     # Repair Operators
     def greedy_max_unique_score_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution by adding libraries that maximize unique book scores"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
+        if not removed_libraries:
+            solution.calculate_fitness_score(self.data.scores)
+            return solution
+            
+        # Calculate current time used
+        curr_time = 0
+        for lib_id in solution.signed_libraries:
+            curr_time += self.data.libs[lib_id].signup_days
         
+        # Sort removed libraries by potential score
+        library_potentials = []
         for lib_id in removed_libraries:
             library = self.data.libs[lib_id]
             if curr_time + library.signup_days >= self.data.num_days:
@@ -392,32 +404,52 @@ class ALNSSolver:
             max_books = time_left * library.books_per_day
             
             # Get unique books and their scores
-            unique_books = sorted(
-                [b.id for b in library.books if b.id not in solution.scanned_books],
-                key=lambda b: self.data.scores[b],
-                reverse=True
-            )[:max_books]
+            unique_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            unique_books.sort(key=lambda b: self.data.scores[b], reverse=True)
+            unique_books = unique_books[:max_books]
             
             if unique_books:
-                solution.signed_libraries.append(lib_id)
-                solution.unsigned_libraries.remove(lib_id)
-                solution.scanned_books_per_library[lib_id] = unique_books
-                solution.scanned_books.update(unique_books)
-                curr_time += library.signup_days
+                potential_score = sum(self.data.scores[b] for b in unique_books)
+                library_potentials.append((potential_score, lib_id, unique_books))
+        
+        # Sort by potential score (descending)
+        library_potentials.sort(key=lambda x: x[0], reverse=True)
+        
+        # Add libraries in order of potential
+        for potential_score, lib_id, books in library_potentials:
+            library = self.data.libs[lib_id]
+            if curr_time + library.signup_days >= self.data.num_days:
+                continue
+                
+            solution.signed_libraries.append(lib_id)
+            solution.unsigned_libraries.remove(lib_id)
+            solution.scanned_books_per_library[lib_id] = books
+            solution.scanned_books.update(books)
+            curr_time += library.signup_days
                 
         solution.calculate_fitness_score(self.data.scores)
         return solution
     
     def regret_score_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution using regret-based insertion"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
+        if not removed_libraries:
+            solution.calculate_fitness_score(self.data.scores)
+            return solution
+            
+        # Calculate current time used
+        curr_time = 0
+        for lib_id in solution.signed_libraries:
+            curr_time += self.data.libs[lib_id].signup_days
         
-        while removed_libraries:
-            max_regret = -1
+        remaining_libraries = removed_libraries.copy()
+        
+        while remaining_libraries:
+            best_regret = -1
             best_lib_id = None
             best_books = None
+            best_time_cost = 0
             
-            for lib_id in removed_libraries:
+            for lib_id in remaining_libraries:
                 library = self.data.libs[lib_id]
                 if curr_time + library.signup_days >= self.data.num_days:
                     continue
@@ -425,38 +457,43 @@ class ALNSSolver:
                 time_left = self.data.num_days - (curr_time + library.signup_days)
                 max_books = time_left * library.books_per_day
                 
-                # Calculate regret (difference between best and second best position)
+                # Calculate regret (score that would be lost if not chosen now)
                 available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
                 if not available_books:
                     continue
                     
                 sorted_books = sorted(available_books, key=lambda b: self.data.scores[b], reverse=True)[:max_books]
-                best_score = sum(self.data.scores[b] for b in sorted_books)
+                regret_score = sum(self.data.scores[b] for b in sorted_books)
                 
-                # Calculate regret as the score that would be lost if not chosen now
-                regret = best_score
-                
-                if regret > max_regret:
-                    max_regret = regret
+                if regret_score > best_regret:
+                    best_regret = regret_score
                     best_lib_id = lib_id
                     best_books = sorted_books
+                    best_time_cost = library.signup_days
             
             if best_lib_id is None:
                 break
                 
-            removed_libraries.remove(best_lib_id)
+            remaining_libraries.remove(best_lib_id)
             solution.signed_libraries.append(best_lib_id)
             solution.unsigned_libraries.remove(best_lib_id)
             solution.scanned_books_per_library[best_lib_id] = best_books
             solution.scanned_books.update(best_books)
-            curr_time += self.data.libs[best_lib_id].signup_days
+            curr_time += best_time_cost
             
         solution.calculate_fitness_score(self.data.scores)
         return solution
     
     def max_books_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution by maximizing the number of books that can be scanned"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
+        if not removed_libraries:
+            solution.calculate_fitness_score(self.data.scores)
+            return solution
+            
+        # Calculate current time used
+        curr_time = 0
+        for lib_id in solution.signed_libraries:
+            curr_time += self.data.libs[lib_id].signup_days
         
         library_potentials = []
         for lib_id in removed_libraries:
@@ -468,27 +505,38 @@ class ALNSSolver:
             max_books = time_left * library.books_per_day
             
             available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
-            potential_books = len(available_books[:max_books])
+            books_to_scan = available_books[:max_books]
             
-            if potential_books > 0:
-                library_potentials.append((lib_id, potential_books, available_books[:max_books]))
+            if books_to_scan:
+                library_potentials.append((len(books_to_scan), lib_id, books_to_scan))
                 
-        # Sort by number of potential books
-        library_potentials.sort(key=lambda x: x[1], reverse=True)
+        # Sort by number of books (descending)
+        library_potentials.sort(key=lambda x: x[0], reverse=True)
         
-        for lib_id, _, books in library_potentials:
+        for num_books, lib_id, books in library_potentials:
+            library = self.data.libs[lib_id]
+            if curr_time + library.signup_days >= self.data.num_days:
+                continue
+                
             solution.signed_libraries.append(lib_id)
             solution.unsigned_libraries.remove(lib_id)
             solution.scanned_books_per_library[lib_id] = books
             solution.scanned_books.update(books)
-            curr_time += self.data.libs[lib_id].signup_days
+            curr_time += library.signup_days
             
         solution.calculate_fitness_score(self.data.scores)
         return solution
     
     def random_feasible_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution by randomly inserting libraries while maintaining feasibility"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
+        if not removed_libraries:
+            solution.calculate_fitness_score(self.data.scores)
+            return solution
+            
+        # Calculate current time used
+        curr_time = 0
+        for lib_id in solution.signed_libraries:
+            curr_time += self.data.libs[lib_id].signup_days
         
         random.shuffle(removed_libraries)
         
