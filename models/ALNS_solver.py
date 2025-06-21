@@ -73,22 +73,57 @@ class ALNSSolver:
         last_print_time = start_time
         print_interval = 30  # Print progress every 30 seconds
         
-        # Get initial solution using GRASP
+        # Allocate time: 10% for initial solution, 90% for ALNS
+        initial_solution_time = min(60, time_limit * 0.1)  # Max 60 seconds for initial solution
+        
+        # Get initial solution using GRASP with limited time
         print("Generating initial solution using GRASP...")
-        current_solution = InitialSolution.generate_initial_solution_grasp(self.data)
+        print(f"Time allocated for initial solution: {initial_solution_time:.1f} seconds")
+        current_solution = InitialSolution.generate_initial_solution_grasp(self.data, max_time=initial_solution_time)
+        
+        # Ensure fitness score is calculated
+        current_solution.calculate_fitness_score(self.data.scores)
         best_solution = current_solution.clone()
+        best_solution.calculate_fitness_score(self.data.scores)
         
         self.stats['initial_score'] = current_solution.fitness_score
+        self.stats['final_score'] = best_solution.fitness_score  # Initialize final score
         print(f"Initial solution score: {current_solution.fitness_score}")
+        print(f"Initial solution has {len(current_solution.signed_libraries)} signed libraries")
+        print(f"Initial solution has {len(current_solution.scanned_books)} scanned books")
+        
+        # Calculate remaining time for ALNS
+        time_after_initial = time.time() - start_time
+        remaining_time = time_limit - time_after_initial
+        print(f"Time remaining for ALNS: {remaining_time:.1f} seconds")
+        
+        if remaining_time <= 0:
+            print("Warning: No time remaining for ALNS optimization!")
+            return best_solution
         
         # Track best operators
         best_destroy_op_count = {op: 0 for op in self.destroy_weights}
         best_repair_op_count = {op: 0 for op in self.repair_weights}
         
-        while (time.time() - start_time) < time_limit:
+        iterations_count = 0
+        accepted_count = 0
+        improvement_count = 0
+        
+        print(f"Starting ALNS loop with time limit: {remaining_time:.1f} seconds")
+        
+        alns_start_time = time.time()
+        while (time.time() - alns_start_time) < remaining_time:
+            iterations_count += 1
+            
+            if iterations_count == 1:
+                print("Entered main ALNS loop successfully")
+            
             # Select destroy and repair operators based on weights
             destroy_op = self._select_operator(self.destroy_weights)
             repair_op = self._select_operator(self.repair_weights)
+            
+            if iterations_count <= 5:  # Debug first few iterations
+                print(f"Iteration {iterations_count}: Selected destroy={destroy_op.__name__}, repair={repair_op.__name__}")
             
             # Create a copy of current solution
             temp_solution = current_solution.clone()
@@ -96,13 +131,33 @@ class ALNSSolver:
             # Apply destroy operator
             removed_libraries = destroy_op(temp_solution)
             
+            if iterations_count <= 5:
+                print(f"Iteration {iterations_count}: Destroyed {len(removed_libraries)} libraries")
+            
             # Apply repair operator
             new_solution = repair_op(temp_solution, removed_libraries)
             
+            # Ensure the new solution has a proper fitness score
+            if hasattr(new_solution, 'fitness_score') and new_solution.fitness_score is not None:
+                # Fitness score already calculated in repair operator
+                pass
+            else:
+                new_solution.calculate_fitness_score(self.data.scores)
+            
+            if iterations_count <= 5:
+                print(f"Iteration {iterations_count}: Repaired solution, new score: {new_solution.fitness_score}")
+            
+            # Debug: Print some information every 100 iterations
+            if iterations_count % 100 == 0:
+                print(f"Iteration {iterations_count}: Current={current_solution.fitness_score}, New={new_solution.fitness_score}, Best={best_solution.fitness_score}")
+            
             # Accept or reject the new solution
-            if new_solution.fitness_score >= current_solution.fitness_score:
+            if new_solution.fitness_score > current_solution.fitness_score:
+                # Clear improvement
                 current_solution = new_solution
                 self.stats['improvements'] += 1
+                improvement_count += 1
+                accepted_count += 1
                 
                 # Update scores for successful operators
                 if new_solution.fitness_score > best_solution.fitness_score:
@@ -115,11 +170,13 @@ class ALNSSolver:
                     best_destroy_op_count[destroy_op] += 1
                     best_repair_op_count[repair_op] += 1
                     
+                    print(f"*** NEW BEST SOLUTION FOUND at iteration {iterations_count}: {best_solution.fitness_score} ***")
+                    
                     # Reset iterations since improvement and reduce destroy percentage
                     self.iterations_since_improvement = 0
                     self.destroy_percentage = max(self.min_destroy_percentage, 
                                                 self.destroy_percentage * 0.9)
-                elif new_solution.fitness_score > current_solution.fitness_score:
+                else:
                     improvement_percentage = ((new_solution.fitness_score - current_solution.fitness_score) 
                                            / current_solution.fitness_score)
                     if improvement_percentage > 0.01:  # More than 1% improvement
@@ -128,11 +185,15 @@ class ALNSSolver:
                     else:
                         self.destroy_scores[destroy_op] += self.score_weights['improvement']
                         self.repair_scores[repair_op] += self.score_weights['improvement']
-                else:
-                    # Equal to current solution
-                    self.destroy_scores[destroy_op] += self.score_weights['accepted']
-                    self.repair_scores[repair_op] += self.score_weights['accepted']
-            # Implement simulated annealing acceptance criterion
+                        
+            elif new_solution.fitness_score == current_solution.fitness_score:
+                # Equal to current solution
+                current_solution = new_solution
+                accepted_count += 1
+                self.destroy_scores[destroy_op] += self.score_weights['accepted']
+                self.repair_scores[repair_op] += self.score_weights['accepted']
+                
+            # Implement simulated annealing acceptance criterion for worse solutions
             else:
                 # Calculate probability of accepting worse solution
                 temperature = max(0.01, 1.0 - (time.time() - start_time) / time_limit)  # Linear cooling
@@ -141,6 +202,7 @@ class ALNSSolver:
                 
                 if random.random() < probability:
                     current_solution = new_solution
+                    accepted_count += 1
                     # Accepted worse solution
                     self.destroy_scores[destroy_op] += self.score_weights['accepted']
                     self.repair_scores[repair_op] += self.score_weights['accepted']
@@ -166,8 +228,16 @@ class ALNSSolver:
             current_time = time.time()
             if current_time - last_print_time >= print_interval:
                 elapsed_time = current_time - start_time
+                acceptance_rate = (accepted_count / iterations_count) * 100 if iterations_count > 0 else 0
+                improvement_rate = (improvement_count / iterations_count) * 100 if iterations_count > 0 else 0
+                
                 print(f"\nProgress after {elapsed_time:.1f} seconds:")
-                print(f"Iterations: {self.stats['iterations']}")
+                print(f"Iterations: {iterations_count}")
+                print(f"Acceptance rate: {acceptance_rate:.1f}%")
+                print(f"Improvement rate: {improvement_rate:.1f}%")
+                print(f"Current score: {current_solution.fitness_score}")
+                print(f"Best score: {best_solution.fitness_score}")
+                print(f"Destroy percentage: {self.destroy_percentage:.3f}")
                 print(f"Time since last improvement: {current_time - (start_time + self.stats['time_to_best']):.1f}s")
                 
                 # Print top destroy operators
@@ -188,11 +258,27 @@ class ALNSSolver:
         total_time = time.time() - start_time
         print("\nFinal Statistics:")
         print(f"Total time: {total_time:.1f} seconds")
-        print(f"Total iterations: {self.stats['iterations']}")
+        print(f"Total iterations: {iterations_count}")
+        print(f"Total accepted solutions: {accepted_count}")
+        print(f"Total improvements: {improvement_count}")
+        
+        if iterations_count > 0:
+            print(f"Acceptance rate: {(accepted_count/iterations_count)*100:.1f}%")
+            print(f"Improvement rate: {(improvement_count/iterations_count)*100:.1f}%")
+        else:
+            print("Acceptance rate: N/A (no iterations completed)")
+            print("Improvement rate: N/A (no iterations completed)")
+            
         print(f"Initial score: {self.stats['initial_score']}")
+        print(f"Final best score: {self.stats['final_score']}")
+        print(f"Improvement: {self.stats['final_score'] - self.stats['initial_score']}")
         print(f"Time to best solution: {self.stats['time_to_best']:.1f} seconds")
-        print(f"Most successful destroy operator: {self.stats['best_destroy_op']}")
-        print(f"Most successful repair operator: {self.stats['best_repair_op']}")
+        
+        if iterations_count > 0:
+            print(f"Most successful destroy operator: {self.stats['best_destroy_op']}")
+            print(f"Most successful repair operator: {self.stats['best_repair_op']}")
+        else:
+            print("No operators were executed")
         
         return best_solution
     
@@ -267,17 +353,22 @@ class ALNSSolver:
     # Destroy Operators
     def random_library_removal(self, solution: Solution) -> List[int]:
         """Randomly remove libraries from the solution"""
+        if not solution.signed_libraries:
+            return []
+            
         num_to_remove = int(len(solution.signed_libraries) * self.destroy_percentage)
         if num_to_remove == 0:
             num_to_remove = 1
             
+        num_to_remove = min(num_to_remove, len(solution.signed_libraries))
         indices_to_remove = random.sample(range(len(solution.signed_libraries)), num_to_remove)
         removed_libraries = []
         
         for idx in sorted(indices_to_remove, reverse=True):
             lib_id = solution.signed_libraries.pop(idx)
             removed_libraries.append(lib_id)
-            solution.unsigned_libraries.append(lib_id)
+            if lib_id not in solution.unsigned_libraries:
+                solution.unsigned_libraries.append(lib_id)
             
             # Remove books from the removed library
             if lib_id in solution.scanned_books_per_library:
@@ -289,6 +380,9 @@ class ALNSSolver:
     
     def low_efficiency_library_removal(self, solution: Solution) -> List[int]:
         """Remove libraries with lowest efficiency (score/signup days)"""
+        if not solution.signed_libraries:
+            return []
+            
         library_efficiencies = []
         for lib_id in solution.signed_libraries:
             library = self.data.libs[lib_id]
@@ -302,11 +396,13 @@ class ALNSSolver:
         if num_to_remove == 0:
             num_to_remove = 1
             
+        num_to_remove = min(num_to_remove, len(solution.signed_libraries))
         removed_libraries = []
         for i in range(num_to_remove):
             lib_id = library_efficiencies[i][0]
             solution.signed_libraries.remove(lib_id)
-            solution.unsigned_libraries.append(lib_id)
+            if lib_id not in solution.unsigned_libraries:
+                solution.unsigned_libraries.append(lib_id)
             removed_libraries.append(lib_id)
             
             if lib_id in solution.scanned_books_per_library:
@@ -318,6 +414,9 @@ class ALNSSolver:
     
     def duplicate_book_removal(self, solution: Solution) -> List[int]:
         """Remove libraries with highest number of duplicate books"""
+        if not solution.signed_libraries:
+            return []
+            
         library_duplicates = []
         for lib_id in solution.signed_libraries:
             books = solution.scanned_books_per_library.get(lib_id, [])
@@ -333,11 +432,13 @@ class ALNSSolver:
         if num_to_remove == 0:
             num_to_remove = 1
             
+        num_to_remove = min(num_to_remove, len(solution.signed_libraries))
         removed_libraries = []
         for i in range(num_to_remove):
             lib_id = library_duplicates[i][0]
             solution.signed_libraries.remove(lib_id)
-            solution.unsigned_libraries.append(lib_id)
+            if lib_id not in solution.unsigned_libraries:
+                solution.unsigned_libraries.append(lib_id)
             removed_libraries.append(lib_id)
             
             if lib_id in solution.scanned_books_per_library:
@@ -349,6 +450,9 @@ class ALNSSolver:
     
     def overlap_based_removal(self, solution: Solution) -> List[int]:
         """Remove libraries with highest overlap in book coverage"""
+        if not solution.signed_libraries:
+            return []
+            
         library_overlaps = []
         for lib_id in solution.signed_libraries:
             books = set(solution.scanned_books_per_library.get(lib_id, []))
@@ -364,11 +468,13 @@ class ALNSSolver:
         if num_to_remove == 0:
             num_to_remove = 1
             
+        num_to_remove = min(num_to_remove, len(solution.signed_libraries))
         removed_libraries = []
         for i in range(num_to_remove):
             lib_id = library_overlaps[i][0]
             solution.signed_libraries.remove(lib_id)
-            solution.unsigned_libraries.append(lib_id)
+            if lib_id not in solution.unsigned_libraries:
+                solution.unsigned_libraries.append(lib_id)
             removed_libraries.append(lib_id)
             
             if lib_id in solution.scanned_books_per_library:
@@ -381,10 +487,24 @@ class ALNSSolver:
     # Repair Operators
     def greedy_max_unique_score_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution by adding libraries that maximize unique book scores"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
-        
+        # Sort removed libraries by potential score
+        library_candidates = []
         for lib_id in removed_libraries:
             library = self.data.libs[lib_id]
+            unique_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            if unique_books:
+                potential_score = sum(self.data.scores[b] for b in unique_books)
+                library_candidates.append((potential_score, lib_id))
+        
+        library_candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Try to add libraries in order of potential score
+        for _, lib_id in library_candidates:
+            library = self.data.libs[lib_id]
+            
+            # Calculate current time based on current library order
+            curr_time = sum(self.data.libs[signed_lib_id].signup_days for signed_lib_id in solution.signed_libraries)
+            
             if curr_time + library.signup_days >= self.data.num_days:
                 continue
                 
@@ -400,25 +520,29 @@ class ALNSSolver:
             
             if unique_books:
                 solution.signed_libraries.append(lib_id)
-                solution.unsigned_libraries.remove(lib_id)
+                if lib_id in solution.unsigned_libraries:
+                    solution.unsigned_libraries.remove(lib_id)
                 solution.scanned_books_per_library[lib_id] = unique_books
                 solution.scanned_books.update(unique_books)
-                curr_time += library.signup_days
                 
         solution.calculate_fitness_score(self.data.scores)
         return solution
     
     def regret_score_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution using regret-based insertion"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
+        remaining_libraries = removed_libraries.copy()
         
-        while removed_libraries:
+        while remaining_libraries:
             max_regret = -1
             best_lib_id = None
             best_books = None
             
-            for lib_id in removed_libraries:
+            for lib_id in remaining_libraries:
                 library = self.data.libs[lib_id]
+                
+                # Calculate current time based on current library order
+                curr_time = sum(self.data.libs[signed_lib_id].signup_days for signed_lib_id in solution.signed_libraries)
+                
                 if curr_time + library.signup_days >= self.data.num_days:
                     continue
                     
@@ -444,23 +568,25 @@ class ALNSSolver:
             if best_lib_id is None:
                 break
                 
-            removed_libraries.remove(best_lib_id)
+            remaining_libraries.remove(best_lib_id)
             solution.signed_libraries.append(best_lib_id)
-            solution.unsigned_libraries.remove(best_lib_id)
+            if best_lib_id in solution.unsigned_libraries:
+                solution.unsigned_libraries.remove(best_lib_id)
             solution.scanned_books_per_library[best_lib_id] = best_books
             solution.scanned_books.update(best_books)
-            curr_time += self.data.libs[best_lib_id].signup_days
             
         solution.calculate_fitness_score(self.data.scores)
         return solution
     
     def max_books_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution by maximizing the number of books that can be scanned"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
-        
         library_potentials = []
         for lib_id in removed_libraries:
             library = self.data.libs[lib_id]
+            
+            # Calculate current time based on current library order
+            curr_time = sum(self.data.libs[signed_lib_id].signup_days for signed_lib_id in solution.signed_libraries)
+            
             if curr_time + library.signup_days >= self.data.num_days:
                 continue
                 
@@ -477,23 +603,40 @@ class ALNSSolver:
         library_potentials.sort(key=lambda x: x[1], reverse=True)
         
         for lib_id, _, books in library_potentials:
-            solution.signed_libraries.append(lib_id)
-            solution.unsigned_libraries.remove(lib_id)
-            solution.scanned_books_per_library[lib_id] = books
-            solution.scanned_books.update(books)
-            curr_time += self.data.libs[lib_id].signup_days
+            # Recalculate current time before adding each library
+            curr_time = sum(self.data.libs[signed_lib_id].signup_days for signed_lib_id in solution.signed_libraries)
+            library = self.data.libs[lib_id]
+            
+            if curr_time + library.signup_days >= self.data.num_days:
+                continue
+                
+            time_left = self.data.num_days - (curr_time + library.signup_days)
+            max_books = time_left * library.books_per_day
+            
+            # Recalculate available books based on current scanned books
+            available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            books_to_add = available_books[:max_books]
+            
+            if books_to_add:
+                solution.signed_libraries.append(lib_id)
+                if lib_id in solution.unsigned_libraries:
+                    solution.unsigned_libraries.remove(lib_id)
+                solution.scanned_books_per_library[lib_id] = books_to_add
+                solution.scanned_books.update(books_to_add)
             
         solution.calculate_fitness_score(self.data.scores)
         return solution
     
     def random_feasible_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution by randomly inserting libraries while maintaining feasibility"""
-        curr_time = sum(self.data.libs[lib_id].signup_days for lib_id in solution.signed_libraries)
-        
         random.shuffle(removed_libraries)
         
         for lib_id in removed_libraries:
             library = self.data.libs[lib_id]
+            
+            # Calculate current time based on current library order
+            curr_time = sum(self.data.libs[signed_lib_id].signup_days for signed_lib_id in solution.signed_libraries)
+            
             if curr_time + library.signup_days >= self.data.num_days:
                 continue
                 
@@ -505,10 +648,10 @@ class ALNSSolver:
             
             if books_to_scan:
                 solution.signed_libraries.append(lib_id)
-                solution.unsigned_libraries.remove(lib_id)
+                if lib_id in solution.unsigned_libraries:
+                    solution.unsigned_libraries.remove(lib_id)
                 solution.scanned_books_per_library[lib_id] = books_to_scan
                 solution.scanned_books.update(books_to_scan)
-                curr_time += library.signup_days
                 
         solution.calculate_fitness_score(self.data.scores)
         return solution 
