@@ -11,39 +11,50 @@ class ALNSSolver:
     def __init__(self, data, destroy_percentage=0.2):
         self.data = data
         self.destroy_percentage = destroy_percentage
-        self.min_destroy_percentage = 0.1
-        self.max_destroy_percentage = 0.5
+        self.min_destroy_percentage = 0.05
+        self.max_destroy_percentage = 0.6
         self.iterations_since_improvement = 0
         
-        # Reaction factor for weight adjustments (how quickly weights adapt)
-        self.reaction_factor = 0.1
+        self.reaction_factor = 0.15
         
         # Segment size for weight adjustments
-        self.segment_size = 100
+        self.segment_size = 50
         
-        # Score weights for different improvement types
         self.score_weights = {
-            'global_best': 15,    # New best solution found
-            'significant': 8,     # Improvement > 1% over current
-            'improvement': 5,     # Any improvement over current
-            'accepted': 2,        # Accepted but not better
-            'rejected': 0         # Not accepted
+            'global_best': 20,    
+            'significant': 10,    
+            'improvement': 6,   
+            'accepted': 3,       
+            'rejected': 0        
         }
         
-        # Weights for destroy operators
         self.destroy_weights = {
             self.random_library_removal: 1.0,
             self.low_efficiency_library_removal: 1.0,
             self.duplicate_book_removal: 1.0,
-            self.overlap_based_removal: 1.0
+            self.overlap_based_removal: 1.0,
+            # New destroy operators
+            self.time_based_removal: 1.0,
+            self.cluster_based_removal: 1.0,
+            self.late_starting_removal: 1.0,
+            self.low_score_density_removal: 1.0,
+            self.adaptive_worst_removal: 1.0,
+            self.bottleneck_removal: 1.0
         }
         
-        # Weights for repair operators
+        # Weights for repair operators (expanded with new operators)
         self.repair_weights = {
             self.greedy_max_unique_score_repair: 1.0,
             self.regret_score_repair: 1.0,
             self.max_books_repair: 1.0,
-            self.random_feasible_repair: 1.0
+            self.random_feasible_repair: 1.0,
+            # New repair operators
+            self.best_fit_repair: 1.0,
+            self.score_density_repair: 1.0,
+            self.time_efficient_repair: 1.0,
+            self.balanced_repair: 1.0,
+            self.local_search_repair: 1.0,
+            self.opportunity_cost_repair: 1.0
         }
         
         # Score tracking for adaptive weight adjustment
@@ -65,29 +76,25 @@ class ALNSSolver:
             'best_repair_op': None
         }
         
-    def solve(self, time_limit=600) -> Solution:  # 10 minutes = 600 seconds
+    def solve(self, time_limit=600) -> Solution:
         """
         Main ALNS solving method that runs for 10 minutes per instance
         """
         start_time = time.time()
         last_print_time = start_time
-        print_interval = 30  # Print progress every 30 seconds
-        
-        # Allocate time: 10% for initial solution, 90% for ALNS
-        initial_solution_time = min(60, time_limit * 0.1)  # Max 60 seconds for initial solution
+        print_interval = 30
+        initial_solution_time = 60 
         
         # Get initial solution using GRASP with limited time
         print("Generating initial solution using GRASP...")
         print(f"Time allocated for initial solution: {initial_solution_time:.1f} seconds")
         current_solution = InitialSolution.generate_initial_solution_grasp(self.data, max_time=initial_solution_time)
-        
-        # Ensure fitness score is calculated
         current_solution.calculate_fitness_score(self.data.scores)
         best_solution = current_solution.clone()
         best_solution.calculate_fitness_score(self.data.scores)
         
         self.stats['initial_score'] = current_solution.fitness_score
-        self.stats['final_score'] = best_solution.fitness_score  # Initialize final score
+        self.stats['final_score'] = best_solution.fitness_score
         print(f"Initial solution score: {current_solution.fitness_score}")
         print(f"Initial solution has {len(current_solution.signed_libraries)} signed libraries")
         print(f"Initial solution has {len(current_solution.scanned_books)} scanned books")
@@ -101,7 +108,6 @@ class ALNSSolver:
             print("Warning: No time remaining for ALNS optimization!")
             return best_solution
         
-        # Track best operators
         best_destroy_op_count = {op: 0 for op in self.destroy_weights}
         best_repair_op_count = {op: 0 for op in self.repair_weights}
         
@@ -122,7 +128,7 @@ class ALNSSolver:
             destroy_op = self._select_operator(self.destroy_weights)
             repair_op = self._select_operator(self.repair_weights)
             
-            if iterations_count <= 5:  # Debug first few iterations
+            if iterations_count <= 5:
                 print(f"Iteration {iterations_count}: Selected destroy={destroy_op.__name__}, repair={repair_op.__name__}")
             
             # Create a copy of current solution
@@ -313,36 +319,46 @@ class ALNSSolver:
         return selected
     
     def _update_weights(self):
-        """Update weights of operators based on their success using reaction factor"""
+        """Enhanced weight update with better normalization and diversity promotion"""
         # Only update weights every segment_size iterations
         if self.stats['iterations'] % self.segment_size != 0:
             return
             
-        # Update destroy weights
-        total_destroy_score = sum(self.destroy_scores.values()) + 1e-10
+        max_destroy_score = max(self.destroy_scores.values()) if self.destroy_scores.values() else 1
+        
         for op in self.destroy_weights:
-            if self.destroy_usage[op] > 0:  # Only update if operator was used
-                normalized_score = self.destroy_scores[op] / self.destroy_usage[op]
-                normalized_score = normalized_score / total_destroy_score
+            if self.destroy_usage[op] > 0:
+                avg_score = self.destroy_scores[op] / self.destroy_usage[op]
+                normalized_score = avg_score / (max_destroy_score + 1e-10)
+                diversity_bonus = 1.0 + (0.5 * (1.0 - self.destroy_usage[op] / sum(self.destroy_usage.values())))
                 
-                # Update weight using reaction factor
+                # Update weight with enhanced reaction factor
+                new_weight = normalized_score * diversity_bonus
                 self.destroy_weights[op] = (
                     (1 - self.reaction_factor) * self.destroy_weights[op] +
-                    self.reaction_factor * normalized_score
+                    self.reaction_factor * new_weight
                 )
-            
-        # Update repair weights similarly
-        total_repair_score = sum(self.repair_scores.values()) + 1e-10
-        for op in self.repair_weights:
-            if self.repair_usage[op] > 0:  # Only update if operator was used
-                normalized_score = self.repair_scores[op] / self.repair_usage[op]
-                normalized_score = normalized_score / total_repair_score
                 
-                # Update weight using reaction factor
+                # Ensure minimum weight for exploration
+                self.destroy_weights[op] = max(0.1, self.destroy_weights[op])
+            
+        # Enhanced repair weight updates (similar approach)
+        max_repair_score = max(self.repair_scores.values()) if self.repair_scores.values() else 1
+        
+        for op in self.repair_weights:
+            if self.repair_usage[op] > 0:
+                avg_score = self.repair_scores[op] / self.repair_usage[op]
+                normalized_score = avg_score / (max_repair_score + 1e-10)
+                
+                diversity_bonus = 1.0 + (0.5 * (1.0 - self.repair_usage[op] / sum(self.repair_usage.values())))
+                
+                new_weight = normalized_score * diversity_bonus
                 self.repair_weights[op] = (
                     (1 - self.reaction_factor) * self.repair_weights[op] +
-                    self.reaction_factor * normalized_score
+                    self.reaction_factor * new_weight
                 )
+                
+                self.repair_weights[op] = max(0.1, self.repair_weights[op])
             
         # Reset scores and usage for next segment
         self.destroy_scores = {op: 0 for op in self.destroy_weights}
@@ -379,7 +395,7 @@ class ALNSSolver:
         return removed_libraries
     
     def low_efficiency_library_removal(self, solution: Solution) -> List[int]:
-        """Remove libraries with lowest efficiency (score/signup days)"""
+        """Enhanced version with better efficiency calculation"""
         if not solution.signed_libraries:
             return []
             
@@ -387,16 +403,28 @@ class ALNSSolver:
         for lib_id in solution.signed_libraries:
             library = self.data.libs[lib_id]
             books = solution.scanned_books_per_library.get(lib_id, [])
-            score = sum(self.data.scores[book_id] for book_id in books)
-            efficiency = score / (library.signup_days + 1e-10)
+            
+            if not books:
+                efficiency = 0
+            else:
+                score = sum(self.data.scores[book_id] for book_id in books)
+                # Consider both time cost and book count
+                time_cost = library.signup_days + len(books) / library.books_per_day
+                efficiency = score / (time_cost + 1e-10)
+                
+                # Penalty for duplicate books
+                unique_books = len([b for b in books if b not in solution.scanned_books or 
+                                  sum(1 for other_lib, other_books in solution.scanned_books_per_library.items() 
+                                      if other_lib != lib_id and b in other_books) == 0])
+                duplicate_penalty = unique_books / len(books) if books else 1
+                efficiency *= duplicate_penalty
+                
             library_efficiencies.append((lib_id, efficiency))
             
         library_efficiencies.sort(key=lambda x: x[1])
-        num_to_remove = int(len(solution.signed_libraries) * self.destroy_percentage)
-        if num_to_remove == 0:
-            num_to_remove = 1
-            
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
         num_to_remove = min(num_to_remove, len(solution.signed_libraries))
+        
         removed_libraries = []
         for i in range(num_to_remove):
             lib_id = library_efficiencies[i][0]
@@ -484,6 +512,178 @@ class ALNSSolver:
                 
         return removed_libraries
     
+    # New Destroy Operators
+    def time_based_removal(self, solution: Solution) -> List[int]:
+        """Remove libraries that consume disproportionate time relative to their score contribution"""
+        if not solution.signed_libraries:
+            return []
+            
+        library_time_efficiency = []
+        for lib_id in solution.signed_libraries:
+            library = self.data.libs[lib_id]
+            books = solution.scanned_books_per_library.get(lib_id, [])
+            
+            if not books:
+                time_efficiency = 0
+            else:
+                score = sum(self.data.scores[book_id] for book_id in books)
+                total_time = library.signup_days + len(books) / library.books_per_day
+                time_efficiency = score / total_time
+                
+            library_time_efficiency.append((lib_id, time_efficiency))
+            
+        library_time_efficiency.sort(key=lambda x: x[1])
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        
+        return self._remove_libraries(solution, [lib for lib, _ in library_time_efficiency[:num_to_remove]])
+    
+    def cluster_based_removal(self, solution: Solution) -> List[int]:
+        """Remove clusters of libraries with high book overlap"""
+        if len(solution.signed_libraries) < 2:
+            return []
+            
+        # Build similarity matrix based on book overlap
+        similarities = {}
+        for i, lib1 in enumerate(solution.signed_libraries):
+            for j, lib2 in enumerate(solution.signed_libraries[i+1:], i+1):
+                books1 = set(solution.scanned_books_per_library.get(lib1, []))
+                books2 = set(solution.scanned_books_per_library.get(lib2, []))
+                
+                if books1 or books2:
+                    overlap = len(books1.intersection(books2))
+                    total_books = len(books1.union(books2))
+                    similarity = overlap / total_books if total_books > 0 else 0
+                    similarities[(lib1, lib2)] = similarity
+        
+        # Find the cluster with highest internal similarity
+        if not similarities:
+            return self.random_library_removal(solution)
+            
+        # Simple clustering: find the pair with highest similarity and expand
+        best_pair = max(similarities.items(), key=lambda x: x[1])
+        cluster = list(best_pair[0])
+        
+        # Expand cluster by adding libraries with high similarity to cluster members
+        for lib_id in solution.signed_libraries:
+            if lib_id not in cluster:
+                avg_similarity = 0
+                count = 0
+                for cluster_lib in cluster:
+                    key = (min(lib_id, cluster_lib), max(lib_id, cluster_lib))
+                    if key in similarities:
+                        avg_similarity += similarities[key]
+                        count += 1
+                
+                if count > 0 and avg_similarity / count > 0.3:  # Threshold for cluster membership
+                    cluster.append(lib_id)
+        
+        # Remove a portion of the cluster
+        num_to_remove = min(len(cluster), max(1, int(len(solution.signed_libraries) * self.destroy_percentage)))
+        libraries_to_remove = random.sample(cluster, num_to_remove)
+        
+        return self._remove_libraries(solution, libraries_to_remove)
+    
+    def late_starting_removal(self, solution: Solution) -> List[int]:
+        """Remove libraries that start late in the scanning timeline"""
+        if not solution.signed_libraries:
+            return []
+            
+        # Calculate start times for each library
+        library_start_times = []
+        current_time = 0
+        
+        for lib_id in solution.signed_libraries:
+            library_start_times.append((lib_id, current_time))
+            current_time += self.data.libs[lib_id].signup_days
+            
+        # Sort by start time (descending) and remove latest starting libraries
+        library_start_times.sort(key=lambda x: x[1], reverse=True)
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        
+        libraries_to_remove = [lib for lib, _ in library_start_times[:num_to_remove]]
+        return self._remove_libraries(solution, libraries_to_remove)
+    
+    def low_score_density_removal(self, solution: Solution) -> List[int]:
+        """Remove libraries with low score per book ratio"""
+        if not solution.signed_libraries:
+            return []
+            
+        library_densities = []
+        for lib_id in solution.signed_libraries:
+            books = solution.scanned_books_per_library.get(lib_id, [])
+            if books:
+                score = sum(self.data.scores[book_id] for book_id in books)
+                density = score / len(books)
+            else:
+                density = 0
+            library_densities.append((lib_id, density))
+            
+        library_densities.sort(key=lambda x: x[1])
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        
+        libraries_to_remove = [lib for lib, _ in library_densities[:num_to_remove]]
+        return self._remove_libraries(solution, libraries_to_remove)
+    
+    def adaptive_worst_removal(self, solution: Solution) -> List[int]:
+        """Adaptively remove worst libraries based on current solution characteristics"""
+        if not solution.signed_libraries:
+            return []
+            
+        # Calculate multiple metrics for each library
+        library_metrics = []
+        for lib_id in solution.signed_libraries:
+            library = self.data.libs[lib_id]
+            books = solution.scanned_books_per_library.get(lib_id, [])
+            
+            if books:
+                score = sum(self.data.scores[book_id] for book_id in books)
+                time_cost = library.signup_days + len(books) / library.books_per_day
+                efficiency = score / time_cost
+                density = score / len(books)
+                
+                # Count unique books (not in other libraries)
+                unique_count = sum(1 for book_id in books if 
+                                 sum(1 for other_lib, other_books in solution.scanned_books_per_library.items()
+                                     if other_lib != lib_id and book_id in other_books) == 0)
+                uniqueness = unique_count / len(books) if books else 0
+                
+                # Composite score (lower is worse)
+                composite_score = efficiency * 0.4 + density * 0.3 + uniqueness * 0.3
+            else:
+                composite_score = 0
+                
+            library_metrics.append((lib_id, composite_score))
+            
+        library_metrics.sort(key=lambda x: x[1])
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        
+        libraries_to_remove = [lib for lib, _ in library_metrics[:num_to_remove]]
+        return self._remove_libraries(solution, libraries_to_remove)
+    
+    def bottleneck_removal(self, solution: Solution) -> List[int]:
+        """Remove libraries that create bottlenecks in the scanning timeline"""
+        if not solution.signed_libraries:
+            return []
+            
+        library_bottlenecks = []
+        for lib_id in solution.signed_libraries:
+            library = self.data.libs[lib_id]
+            books = solution.scanned_books_per_library.get(lib_id, [])
+            
+            # Calculate bottleneck score based on signup time vs scanning time ratio
+            signup_time = library.signup_days
+            scanning_time = len(books) / library.books_per_day if books and library.books_per_day > 0 else 0
+            
+            # High signup time relative to scanning time indicates a bottleneck
+            bottleneck_score = signup_time / (scanning_time + 1) if scanning_time > 0 else signup_time
+            library_bottlenecks.append((lib_id, bottleneck_score))
+            
+        library_bottlenecks.sort(key=lambda x: x[1], reverse=True)
+        num_to_remove = max(1, int(len(solution.signed_libraries) * self.destroy_percentage))
+        
+        libraries_to_remove = [lib for lib, _ in library_bottlenecks[:num_to_remove]]
+        return self._remove_libraries(solution, libraries_to_remove)
+
     # Repair Operators
     def greedy_max_unique_score_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
         """Repair solution by adding libraries that maximize unique book scores"""
@@ -654,4 +854,279 @@ class ALNSSolver:
                 solution.scanned_books.update(books_to_scan)
                 
         solution.calculate_fitness_score(self.data.scores)
-        return solution 
+        return solution
+    
+    # New Repair Operators
+    def best_fit_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
+        """Insert libraries at positions that minimize timeline disruption"""
+        # Sort libraries by their potential contribution
+        library_candidates = []
+        for lib_id in removed_libraries:
+            library = self.data.libs[lib_id]
+            available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            if available_books:
+                potential_score = sum(self.data.scores[b] for b in available_books)
+                efficiency = potential_score / (library.signup_days + len(available_books) / library.books_per_day)
+                library_candidates.append((lib_id, efficiency, potential_score))
+        
+        library_candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        for lib_id, _, _ in library_candidates:
+            best_position = self._find_best_insertion_position(solution, lib_id)
+            if best_position is not None:
+                self._insert_library_at_position(solution, lib_id, best_position)
+        
+        solution.calculate_fitness_score(self.data.scores)
+        return solution
+    
+    def score_density_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
+        """Prioritize libraries with highest score per book ratio"""
+        library_densities = []
+        for lib_id in removed_libraries:
+            library = self.data.libs[lib_id]
+            available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            if available_books:
+                score = sum(self.data.scores[b] for b in available_books)
+                density = score / len(available_books)
+                library_densities.append((lib_id, density, available_books))
+        
+        library_densities.sort(key=lambda x: x[1], reverse=True)
+        
+        for lib_id, _, available_books in library_densities:
+            if self._can_add_library(solution, lib_id):
+                self._add_library_to_solution(solution, lib_id, available_books)
+        
+        solution.calculate_fitness_score(self.data.scores)
+        return solution
+    
+    def time_efficient_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
+        """Prioritize libraries that can be completed quickly"""
+        library_times = []
+        for lib_id in removed_libraries:
+            library = self.data.libs[lib_id]
+            available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            if available_books:
+                total_time = library.signup_days + len(available_books) / library.books_per_day
+                score = sum(self.data.scores[b] for b in available_books)
+                library_times.append((lib_id, total_time, score, available_books))
+        
+        # Sort by time (ascending) but weight by score
+        library_times.sort(key=lambda x: x[1] / (x[2] + 1))
+        
+        for lib_id, _, _, available_books in library_times:
+            if self._can_add_library(solution, lib_id):
+                self._add_library_to_solution(solution, lib_id, available_books)
+        
+        solution.calculate_fitness_score(self.data.scores)
+        return solution
+    
+    def balanced_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
+        """Balance between score, time efficiency, and book count"""
+        library_scores = []
+        for lib_id in removed_libraries:
+            library = self.data.libs[lib_id]
+            available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            if available_books:
+                score = sum(self.data.scores[b] for b in available_books)
+                time_cost = library.signup_days + len(available_books) / library.books_per_day
+                efficiency = score / time_cost
+                book_count = len(available_books)
+                
+                # Balanced score: 50% efficiency, 30% raw score, 20% book count
+                balanced_score = 0.5 * efficiency + 0.3 * score + 0.2 * book_count
+                library_scores.append((lib_id, balanced_score, available_books))
+        
+        library_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        for lib_id, _, available_books in library_scores:
+            if self._can_add_library(solution, lib_id):
+                self._add_library_to_solution(solution, lib_id, available_books)
+        
+        solution.calculate_fitness_score(self.data.scores)
+        return solution
+    
+    def local_search_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
+        """Apply local search optimization after greedy insertion"""
+        # First, do greedy insertion
+        solution = self.greedy_max_unique_score_repair(solution, removed_libraries)
+        
+        # Then apply local search improvements
+        improved = True
+        iterations = 0
+        max_iterations = 10
+        
+        while improved and iterations < max_iterations:
+            improved = False
+            iterations += 1
+            
+            # Try swapping adjacent libraries
+            for i in range(len(solution.signed_libraries) - 1):
+                original_score = solution.fitness_score
+                
+                # Swap libraries i and i+1
+                temp_solution = solution.clone()
+                temp_solution.signed_libraries[i], temp_solution.signed_libraries[i+1] = \
+                    temp_solution.signed_libraries[i+1], temp_solution.signed_libraries[i]
+                
+                # Recalculate scanned books for the swapped solution
+                self._recalculate_scanned_books(temp_solution)
+                temp_solution.calculate_fitness_score(self.data.scores)
+                
+                if temp_solution.fitness_score > original_score:
+                    solution = temp_solution
+                    improved = True
+                    break
+        
+        return solution
+    
+    def opportunity_cost_repair(self, solution: Solution, removed_libraries: List[int]) -> Solution:
+        """Consider opportunity cost of not selecting libraries"""
+        library_opportunities = []
+        
+        for lib_id in removed_libraries:
+            library = self.data.libs[lib_id]
+            available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            
+            if available_books:
+                # Calculate direct benefit
+                direct_score = sum(self.data.scores[b] for b in available_books)
+                
+                # Calculate opportunity cost (what we lose by not taking it)
+                opportunity_cost = 0
+                for other_lib_id in removed_libraries:
+                    if other_lib_id != lib_id:
+                        other_library = self.data.libs[other_lib_id]
+                        overlapping_books = [b.id for b in other_library.books 
+                                           if b.id in available_books and b.id not in solution.scanned_books]
+                        if overlapping_books:
+                            opportunity_cost += sum(self.data.scores[b] for b in overlapping_books)
+                
+                total_value = direct_score + opportunity_cost * 0.3  # Weight opportunity cost
+                library_opportunities.append((lib_id, total_value, available_books))
+        
+        library_opportunities.sort(key=lambda x: x[1], reverse=True)
+        
+        for lib_id, _, available_books in library_opportunities:
+            if self._can_add_library(solution, lib_id):
+                self._add_library_to_solution(solution, lib_id, available_books)
+        
+        solution.calculate_fitness_score(self.data.scores)
+        return solution
+
+    # Helper methods for new operators
+    def _remove_libraries(self, solution: Solution, libraries_to_remove: List[int]) -> List[int]:
+        """Helper method to remove libraries from solution"""
+        removed_libraries = []
+        for lib_id in libraries_to_remove:
+            if lib_id in solution.signed_libraries:
+                solution.signed_libraries.remove(lib_id)
+                if lib_id not in solution.unsigned_libraries:
+                    solution.unsigned_libraries.append(lib_id)
+                removed_libraries.append(lib_id)
+                
+                if lib_id in solution.scanned_books_per_library:
+                    books = solution.scanned_books_per_library[lib_id]
+                    solution.scanned_books.difference_update(books)
+                    del solution.scanned_books_per_library[lib_id]
+        
+        return removed_libraries
+    
+    def _find_best_insertion_position(self, solution: Solution, lib_id: int) -> int:
+        """Find the best position to insert a library in the timeline"""
+        best_position = None
+        best_score_improvement = -1
+        
+        library = self.data.libs[lib_id]
+        
+        # Try inserting at each position
+        for pos in range(len(solution.signed_libraries) + 1):
+            temp_solution = solution.clone()
+            temp_solution.signed_libraries.insert(pos, lib_id)
+            
+            # Calculate if this position is feasible and beneficial
+            curr_time = 0
+            feasible = True
+            
+            for i, signed_lib_id in enumerate(temp_solution.signed_libraries):
+                lib = self.data.libs[signed_lib_id]
+                curr_time += lib.signup_days
+                
+                if curr_time >= self.data.num_days:
+                    feasible = False
+                    break
+                    
+                if signed_lib_id == lib_id:
+                    # Calculate potential books for the inserted library
+                    time_left = self.data.num_days - curr_time
+                    max_books = time_left * lib.books_per_day
+                    available_books = [b.id for b in lib.books if b.id not in solution.scanned_books]
+                    books_to_scan = available_books[:max_books]
+                    
+                    if books_to_scan:
+                        score_improvement = sum(self.data.scores[b] for b in books_to_scan)
+                        if score_improvement > best_score_improvement:
+                            best_score_improvement = score_improvement
+                            best_position = pos
+            
+            if not feasible:
+                continue
+        
+        return best_position
+    
+    def _insert_library_at_position(self, solution: Solution, lib_id: int, position: int):
+        """Insert library at specific position and update scanned books"""
+        solution.signed_libraries.insert(position, lib_id)
+        if lib_id in solution.unsigned_libraries:
+            solution.unsigned_libraries.remove(lib_id)
+        
+        # Recalculate all scanned books due to position change
+        self._recalculate_scanned_books(solution)
+    
+    def _can_add_library(self, solution: Solution, lib_id: int) -> bool:
+        """Check if library can be added to solution"""
+        curr_time = sum(self.data.libs[signed_lib_id].signup_days for signed_lib_id in solution.signed_libraries)
+        library = self.data.libs[lib_id]
+        return curr_time + library.signup_days < self.data.num_days
+    
+    def _add_library_to_solution(self, solution: Solution, lib_id: int, available_books: List[int]):
+        """Add library to solution with specified books"""
+        library = self.data.libs[lib_id]
+        curr_time = sum(self.data.libs[signed_lib_id].signup_days for signed_lib_id in solution.signed_libraries)
+        
+        if curr_time + library.signup_days >= self.data.num_days:
+            return
+            
+        time_left = self.data.num_days - (curr_time + library.signup_days)
+        max_books = time_left * library.books_per_day
+        books_to_scan = sorted(available_books, key=lambda b: self.data.scores[b], reverse=True)[:max_books]
+        
+        if books_to_scan:
+            solution.signed_libraries.append(lib_id)
+            if lib_id in solution.unsigned_libraries:
+                solution.unsigned_libraries.remove(lib_id)
+            solution.scanned_books_per_library[lib_id] = books_to_scan
+            solution.scanned_books.update(books_to_scan)
+    
+    def _recalculate_scanned_books(self, solution: Solution):
+        """Recalculate all scanned books based on current library order"""
+        solution.scanned_books = set()
+        solution.scanned_books_per_library = {}
+        
+        curr_time = 0
+        for lib_id in solution.signed_libraries:
+            library = self.data.libs[lib_id]
+            curr_time += library.signup_days
+            
+            if curr_time >= self.data.num_days:
+                solution.signed_libraries = solution.signed_libraries[:solution.signed_libraries.index(lib_id)]
+                break
+                
+            time_left = self.data.num_days - curr_time
+            max_books = time_left * library.books_per_day
+            
+            available_books = [b.id for b in library.books if b.id not in solution.scanned_books]
+            books_to_scan = sorted(available_books, key=lambda b: self.data.scores[b], reverse=True)[:max_books]
+            
+            if books_to_scan:
+                solution.scanned_books_per_library[lib_id] = books_to_scan
+                solution.scanned_books.update(books_to_scan) 

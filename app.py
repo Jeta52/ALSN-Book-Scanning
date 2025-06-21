@@ -12,7 +12,7 @@ def run_instances(output_dir='output'):
     os.makedirs(output_dir, exist_ok=True)
 
     for file in directory:
-        if file.endswith('.txt'):
+        if file.endswith(('.txt', '.in')):
             print(f'\nProcessing instance: ./input/{file}')
             print('-' * 50)
             
