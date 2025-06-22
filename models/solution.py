@@ -1,15 +1,10 @@
 class Solution:
-    signed_libraries = []
-    unsigned_libraries = []
-    scanned_books_per_library = {}
-    scanned_books = set()
-    fitness_score = -1
-
     def __init__(self, signed_libs, unsigned_libs, scanned_books_per_library, scanned_books):
         self.signed_libraries = signed_libs
         self.unsigned_libraries = unsigned_libs
         self.scanned_books_per_library = scanned_books_per_library
         self.scanned_books = scanned_books
+        self.fitness_score = -1
 
     def export(self, file_path):
         with open(file_path, "w+") as ofp:
@@ -59,9 +54,11 @@ class Solution:
         self.fitness_score = updated_fitness
 
     def clone(self):
-        return Solution(
+        cloned_solution = Solution(
             self.signed_libraries.copy(),
             self.unsigned_libraries.copy(),
             {k: v.copy() for k, v in self.scanned_books_per_library.items()},
             self.scanned_books.copy()
         )
+        cloned_solution.fitness_score = self.fitness_score
+        return cloned_solution
